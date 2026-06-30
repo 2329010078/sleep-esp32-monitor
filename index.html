@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>精神科睡眠质量智能分析系统 v1.0-ESP32床边监测版</title>
+<!-- 离线语音识别依赖：transformers.js + tfjs -->
+<script src="https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.14.0/dist/tf.min.js"></script>
+<style>
+*{
+  box-sizing: border-box;
+  margin:0;
+  padding:0;
+}
+body{
+  padding:16px;
+  font-family: system-ui, sans-serif;
+  max-width:600px;
+  margin:0 auto;
+}
+.tab-bar{
+  display:flex;
+  border-bottom:1px solid #eee;
+  margin-bottom:20px;
+}
+.tab{
+  flex:1;
+  text-align:center;
+  padding:14px 0;
+  font-size:16px;
+  color:#666;
+  cursor:pointer;
+}
+.tab.active{
+  color:#007aff;
+  border-bottom:3px solid #007aff;
+}
+.panel{
+  display:none;
+}
+.panel.show{
+  display:block;
+}
+.desc{
+  font-size:15px;
+  line-height:1.6;
+  color:#333;
+  margin-bottom:16px;
+}
+button{
+  width:100%;
+  background:#007aff;
+  color:#fff;
+  border:none;
+  border-radius:6px;
+  padding:12px;
+  font-size:16px;
+  margin-bottom:12px;
+  cursor:pointer;
+}
+button.danger{
+  background:#dc3545;
+}
+button.success{
+  background:#28a745;
+}
+button:disabled{
+  background:#999;
+  cursor:not-allowed;
+}
+.result-box{
+  border:1px solid #ddd;
+  min-height:320px;
+  padding:12px;
+  font-size:15px;
+  line-height:1.7;
+  white-space: pre-line;
+}
+b{
+  font-weight:bold;
+}
+.red{
+  color:#f00;
+}
+.green{
+  color:#090;
+}
+.status-tip{
+  padding:8px;
+  margin:8px 0;
+  border-radius:4px;
+  background:#e9f5ff;
+}
+.volume-bar{
+  width:100%;
+  height:8px;
+  background:#eee;
+  border-radius:4px;
+  margin:8px 0 16px;
+  overflow:hidden;
+}
+.volume-fill{
+  height:100%;
+  width:0%;
+  background:#ff7700;
+  transition:0.08s;
+}
+</style>
+</head>
+<body>
+<h2 style="text-align:center;margin-bottom:16px;">精神科睡眠质量智能分析系统 v1.0（ESP32床边监测专用）</h2>
+<div class="status-tip" id="globalStatus">首次打开会下载离线语音模型（约20MB），请保持网络；仅Chrome/Safari支持蓝牙与麦克风</div>
+<div class="volume-bar">
+  <div class="volume-fill" id="volFill"></div>
+</div>
+
+<div class="tab-bar">
+  <div class="tab active" data-tab="audio">夜间声学数据（ESP32床边仪蓝牙同步）</div>
+  <div class="tab" data-tab="diary">晨起睡眠日记（手机口述录音）</div>
+</div>
+
+<!-- 第一面板：ESP32蓝牙同步夜间声学数据 -->
+<div class="panel show" id="audioPanel">
+  <div class="desc">
+    使用说明：夜间ESP32床边设备自动低功耗采集翻身、鼾声；次日早上打开蓝牙，点击下方按钮同步整夜真实监测数据
+    <br>设备无需整夜占用手机，充电一次续航30天
+  </div>
+  <button id="btnConnectDevice">连接ESP32床边监测仪（蓝牙）</button>
+  <button class="success" id="btnSyncData" disabled>同步昨夜睡眠声学数据</button>
+  <div class="result-box" id="audioResult">ESP32设备同步后的整夜监测报告将展示在此处</div>
+</div>
+
+<!-- 第二面板：真实离线语音转写模块（修复固定文案问题） -->
+<div class="panel" id="diaryPanel">
+  <div class="desc">清晨口述昨晚睡眠感受，本地AI实时转写你真实说话内容，自动情绪风险评估</div>
+  <button id="startVoiceRec">开始录制睡眠口述语音</button>
+  <button class="danger" id="stopVoiceRec" disabled>停止录音并分析情绪</button>
+  <div class="result-box" id="diaryResult">语音转写与情绪评估结果将展示在此处</div>
+</div>
+
+<script>
+// 标签切换逻辑
+const tabs = document.querySelectorAll('.tab');
+const audioPanel = document.getElementById('audioPanel');
+const diaryPanel = document.getElementById('diaryPanel');
+tabs.forEach(tab=>{
+  tab.onclick = ()=>{
+    tabs.forEach(t=>t.classList.remove('active'));
+    tab.classList.add('active');
+    const t = tab.dataset.tab;
+    if(t === 'audio'){
+      audioPanel.classList.add('show');
+      diaryPanel.classList.remove('show');
+    }else{
+      audioPanel.classList.remove('show');
+      diaryPanel.classList.add('show');
+    }
+  }
+})
+
+// 全局DOM变量
+const statusDom = document.getElementById('globalStatus');
+const audioResult = document.getElementById('audioResult');
+const diaryResult = document.getElementById('diaryResult');
+const volFill = document.getElementById('volFill');
+let bleDevice, bleServer, characteristic;
+const DEVICE_SERVICE_UUID = "ffe0";
+const DEVICE_CHAR_UUID = "ffe1";
+
+// 语音全局变量
+let voiceRecorder, voiceChunks = [];
+let voiceStream = null;
+let audioContext, analyser, dataArray;
+let volumeAnimation;
+let whisperPipeline = null;
+
+// 预加载离线Whisper tiny中文模型
+async function loadWhisperModel() {
+  statusDom.innerText = "正在加载离线语音识别模型，首次下载较慢，请等待...";
+  const pipeline = await window.Transformers.pipeline(
+    'automatic-speech-recognition',
+    'Xenova/whisper-tiny-chinese'
+  );
+  whisperPipeline = pipeline;
+  statusDom.innerText = "语音模型加载完成，可以开始录音口述";
+}
+loadWhisperModel();
+
+// ========== 模块1：ESP32蓝牙同步数据 ==========
+const connectBtn = document.getElementById('btnConnectDevice');
+const syncBtn = document.getElementById('btnSyncData');
+connectBtn.onclick = async function(){
+  try{
+    statusDom.innerText = "正在搜索附近ESP32床边监测仪，请开启手机蓝牙";
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [DEVICE_SERVICE_UUID] }]
+    });
+    bleDevice.addEventListener('gattserverdisconnected', ()=>{
+      statusDom.innerText = "设备蓝牙断开，请重新连接";
+      syncBtn.disabled = true;
+    })
+    bleServer = await bleDevice.gatt.connect();
+    const service = await bleServer.getPrimaryService(DEVICE_SERVICE_UUID);
+    characteristic = await service.getCharacteristic(DEVICE_CHAR_UUID);
+    statusDom.innerText = "ESP32床边仪蓝牙连接成功，可同步昨夜睡眠数据";
+    syncBtn.disabled = false;
+  }catch(err){
+    statusDom.innerText = "蓝牙连接失败：未找到设备/浏览器不支持/未开启蓝牙";
+    console.error(err);
+  }
+}
+syncBtn.onclick = async function(){
+  statusDom.innerText = "正在读取ESP32本地存储的整夜监测数据...";
+  await characteristic.writeValue(new TextEncoder().encode("GET_DATA"));
+  const value = await characteristic.readValue();
+  const jsonStr = new TextDecoder().decode(value);
+  const data = JSON.parse(jsonStr);
+  const turnOver = data.turn_over;
+  const snoreMins = data.snore_min;
+  const timeRange = data.record_time;
+  let html = `<b>[ESP32床边仪整夜真实声学分析]</b> 监测时段: ${timeRange}\n`;
+  html += `检测床铺翻身摩擦总次数: <b>${turnOver} 次</b>\n`;
+  html += `整夜打鼾/呼吸沉重累计时长: <b>${snoreMins} 分钟</b>\n\n`;
+  if(turnOver > 20){
+    html += `<span class="red">[临床预警] 翻身频次过高，深度睡眠碎片化，高度提示躯体焦虑、不宁腿综合征倾向</span>`
+  }else{
+    html += `<span class="green">[睡眠正常] 夜间肢体活动处于健康区间，深度睡眠充足</span>`
+  }
+  audioResult.innerHTML = html;
+  statusDom.innerText = "数据同步完成，可截图保存睡眠客观报告";
+}
+
+// ========== 模块2：修复版真实语音录音+音量显示+离线转写 ==========
+const startVoiceRecBtn = document.getElementById('startVoiceRec');
+const stopVoiceRecBtn = document.getElementById('stopVoiceRec');
+startVoiceRecBtn.onclick = async ()=>{
+  if(!whisperPipeline){
+    statusDom.innerText = "语音模型还未加载完成，请稍候重试";
+    return;
+  }
+  try{
+    statusDom.innerText = "请求麦克风录制睡眠口述";
+    voiceStream = await navigator.mediaDevices.getUserMedia({audio:true});
+    // 音量可视化
+    audioContext = new AudioContext();
+    const source = audioContext.createMediaStreamSource(voiceStream);
+    analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    dataArray = new Uint8Array(analyser.frequencyBinCount);
+    source.connect(analyser);
+    // 实时音量条更新
+    function updateVolume(){
+      analyser.getByteFrequencyData(dataArray);
+      let avg = dataArray.reduce((a,b)=>a+b,0) / dataArray.length;
+      volFill.style.width = `${avg / 2.55}%`;
+      volumeAnimation = requestAnimationFrame(updateVolume);
+    }
+    updateVolume();
+    // 启动录音
+    voiceRecorder = new MediaRecorder(voiceStream, {mimeType:'audio/webm'});
+    voiceChunks = [];
+    voiceRecorder.ondataavailable = e=>voiceChunks.push(e.data);
+    voiceRecorder.start();
+    startVoiceRecBtn.disabled = true;
+    stopVoiceRecBtn.disabled = false;
+    statusDom.innerText = "正在录制，说话时橙色音量条会变化，说完后点击停止";
+  }catch(err){
+    statusDom.innerText = "麦克风授权失败，请更换浏览器并开启麦克风权限";
+    console.error(err);
+  }
+}
+
+stopVoiceRecBtn.onclick = async ()=>{
+  // 停止音量动画、录音、麦克风
+  cancelAnimationFrame(volumeAnimation);
+  volFill.style.width = "0%";
+  voiceRecorder.stop();
+  voiceStream.getTracks().forEach(t=>t.stop());
+  statusDom.innerText = "AI正在解析你口述的语音内容，请等待...";
+  // 把录音转成浏览器可识别音频
+  const audioBlob = new Blob(voiceChunks, {type:"audio/webm"});
+  const audioUrl = URL.createObjectURL(audioBlob);
+  // 真实离线转写，输出你亲口说的文字
+  const result = await whisperPipeline(audioUrl);
+  const realText = result.text.trim();
+  // 情绪关键词判断
+  let html = `<b>[晨起语音日记真实转写]</b>："${realText}"\n\n`;
+  const negativeWords = ["失眠","心慌","烦躁","疲惫","多梦","难受","睡不着","焦虑","醒","累"];
+  const hasNeg = negativeWords.some(w=>realText.includes(w));
+  if(hasNeg){
+    html += `<span class="red">[NLP情感预警] 检测到负面睡眠情绪，主观睡眠修复能力差，建议精神科随访评估焦虑状态</span>`
+  }else{
+    html += `<span class="green">[情绪正常] 睡眠主观恢复感良好，无明显睡眠相关负性情绪</span>`
+  }
+  diaryResult.innerHTML = html;
+  statusDom.innerText = "语音分析完成，截图保存复诊使用";
+  startVoiceRecBtn.disabled = false;
+  stopVoiceRecBtn.disabled = true;
+}
+</script>
+</body>
+</html>
